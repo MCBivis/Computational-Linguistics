@@ -1,5 +1,6 @@
 from neo4j import GraphDatabase
-
+import random
+import string
 class Neo4jRepository:
 
     def __init__(self, uri, user, password):
@@ -102,3 +103,78 @@ class Neo4jRepository:
         """
         with self.driver.session() as session:
             session.run(query, id=arc_id)
+
+    def update_node(self, uri: str, params: dict):
+        if not params:
+            return None
+        query = """
+        MATCH (n {uri:$uri})
+        SET n += $props
+        RETURN n
+        """
+        with self.driver.session() as session:
+            result = session.run(
+                query,
+                uri=uri,
+                props=params
+            )
+            record = result.single()
+            return record["n"]
+
+    def generate_random_string(
+            self,
+            namespace: str = "mygraph",
+            length: int = 10
+    ):
+        chars = string.ascii_letters + string.digits
+        random_part = "".join(
+            random.choice(chars)
+            for _ in range(length)
+        )
+        uri = f"http://{namespace}.com/{random_part}"
+        return uri
+
+    def collect_node(self, node):
+        if node is None:
+            return None
+        labels = list(node.labels)
+        label = labels[0] if labels else None
+        return {
+            "uri": node.get("uri"),
+            "description": node.get("description"),
+            "label": label
+        }
+
+    def collect_arc(self, arc):
+        if arc is None:
+            return None
+        start_node = arc.start_node
+        end_node = arc.end_node
+        return {
+            "id": arc.element_id,
+            "uri": arc.type,
+            "node_uri_from": start_node.get("uri"),
+            "node_uri_to": end_node.get("uri")
+        }
+
+    def transform_labels(self, labels, separator = ':'):
+        if len(labels) == 0:
+            return '``'
+        res = ''
+        for l in labels:
+            i = '`{l}`'.format(l=l) + separator
+            res +=i
+        return res[:-1]
+
+    def transform_props(self, props):
+        if len(props) == 0:
+            return ''
+        data = "{"
+        for p in props:
+            temp = "`{p}`".format(p=p)
+            temp +=':'
+            temp += "{val}".format(val = json.dumps(props[p]))
+            data += temp + ','
+        data = data[:-1]
+        data += "}"
+        return data

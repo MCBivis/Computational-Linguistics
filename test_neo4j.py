@@ -35,4 +35,23 @@ repo.delete_node_by_uri("100")
 repo.delete_node_by_uri("200")
 print(repo.get_all_nodes_and_arcs())
 
+print("=== Update ===")
+print(repo.update_node("1", {"age": 37}))
+repo.update_node("1", {"age": 22})
+
+print("=== Generate String ===")
+print(repo.generate_random_string())
+print(repo.generate_random_string("university"))
+
+print("=== Collects ===")
+node = repo.create_node({
+    "label": "Person",
+    "uri": "300",
+    "name": "Alex",
+    "description": "Student from Moscow"
+})
+print(repo.collect_node(node))
+repo.delete_node_by_uri("300")
+
+
 repo.close()
