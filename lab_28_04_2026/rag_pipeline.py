@@ -11,9 +11,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lab_10_03_2026.embeddings import cos_compare, get_embeddings
 
+import re
 
 DEFAULT_GPT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+MAX_FRAGMENT_CHARS = 700
 
 TECH_KEYS = {
     "uri",
@@ -43,6 +45,217 @@ class NodeParagraph:
     node_id: str
     title: str
     text: str
+
+@dataclass
+class TextFragment:
+    node_uri: str
+    entity_name: str
+    fragment: str
+
+@dataclass
+class SentenceInfo:
+    start: int
+    end: int
+    text: str
+
+@dataclass
+class SentenceLookup:
+    sentences: List[SentenceInfo]
+    word_to_sentence: List[int]
+
+def load_markup(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_sentence_lookup(words: List[str]) -> SentenceLookup:
+
+    sentences: List[SentenceInfo] = []
+
+    sentence_endings = {".", "!", "?"}
+
+    current_words: List[str] = []
+    start = 0
+
+    for idx, word in enumerate(words):
+
+        if not word:
+            continue
+
+        current_words.append(word)
+
+        if word in sentence_endings:
+
+            sentence_text = " ".join(current_words).strip()
+
+            sentences.append(
+                SentenceInfo(
+                    start=start,
+                    end=idx,
+                    text=sentence_text,
+                )
+            )
+
+            current_words = []
+            start = idx + 1
+
+    if current_words:
+        sentences.append(
+            SentenceInfo(
+                start=start,
+                end=len(words) - 1,
+                text=" ".join(current_words).strip(),
+            )
+        )
+
+    word_to_sentence = [-1] * len(words)
+
+    for sentence_idx, sentence in enumerate(sentences):
+
+        for word_idx in range(sentence.start, sentence.end + 1):
+            word_to_sentence[word_idx] = sentence_idx
+
+    return SentenceLookup(
+        sentences=sentences,
+        word_to_sentence=word_to_sentence,
+    )
+
+
+def build_word_array(text_with_ids: Dict[str, str]) -> List[str]:
+    max_id = max(int(k) for k in text_with_ids.keys())
+
+    words = [""] * (max_id + 1)
+
+    for k, v in text_with_ids.items():
+        cleaned = str(v).replace("\n", "").strip()
+        words[int(k)] = cleaned
+
+    return words
+
+
+def extract_sentence_fragment(
+    lookup: SentenceLookup,
+    pos_start: int,
+    neighbour_sentences: int = 1,
+) -> str:
+
+    if pos_start >= len(lookup.word_to_sentence):
+        return ""
+
+    target_index = lookup.word_to_sentence[pos_start]
+
+    if target_index < 0:
+        return ""
+
+    left = max(0, target_index - neighbour_sentences)
+
+    right = min(
+        len(lookup.sentences),
+        target_index + neighbour_sentences + 1,
+    )
+
+    fragment = " ".join(
+        sentence.text
+        for sentence in lookup.sentences[left:right]
+    )
+
+    fragment = re.sub(r"\s+", " ", fragment).strip()
+
+    return fragment[:MAX_FRAGMENT_CHARS]
+
+
+def collect_text_fragments(
+    markup_data: Dict[str, Any],
+    target_node_uris: set[str],
+) -> List[TextFragment]:
+
+    words = build_word_array(markup_data["textWithIds"])
+    lookup = build_sentence_lookup(words)
+
+    fragments = []
+
+    for entity in markup_data["entites"]:
+
+        node_uri = entity["node_uri"]
+
+        if node_uri not in target_node_uris:
+            continue
+
+        fragment = extract_sentence_fragment(
+            lookup,
+            entity["pos_start"],
+        )
+
+        node = entity.get("node", {})
+        title = _node_label(node)
+
+        fragments.append(
+            TextFragment(
+                node_uri=node_uri,
+                entity_name=title,
+                fragment=fragment,
+            )
+        )
+
+    return fragments
+
+
+def retrieve_text_fragments(
+    markup_paths: List[Path],
+    target_uris: set[str],
+    query_embedding: np.ndarray,
+    embedding_model: str,
+    top_k: int = 3,
+) -> List[TextFragment]:
+
+    all_fragments: List[TextFragment] = []
+
+    for markup_path in markup_paths:
+
+        markup_data = load_markup(markup_path)
+
+        fragments = collect_text_fragments(
+            markup_data,
+            target_uris,
+        )
+
+        all_fragments.extend(fragments)
+
+    if not all_fragments:
+        return []
+
+    unique_fragments: Dict[str, TextFragment] = {}
+
+    for fragment in all_fragments:
+
+        cleaned = fragment.fragment.strip()
+
+        if not cleaned:
+            continue
+
+        unique_fragments[cleaned] = fragment
+
+    all_fragments = list(unique_fragments.values())
+
+    fragment_texts = [
+        f.fragment
+        for f in all_fragments
+    ]
+
+    fragment_embeddings = get_embeddings(
+        fragment_texts,
+        model_name=embedding_model,
+    )
+
+    fragment_ids = top_k_indices(
+        query_embedding,
+        fragment_embeddings,
+        k=top_k,
+    )
+
+    return [
+        all_fragments[i]
+        for i in fragment_ids
+    ]
 
 
 def _tail(uri_or_name: str) -> str:
@@ -217,13 +430,28 @@ def top_k_indices(query_embedding: np.ndarray, index_embeddings: np.ndarray, k: 
     return [int(i) for i in top_ids]
 
 
-def build_prompt(question: str, contexts: List[str]) -> str:
-    joined = "\n\n".join(contexts)
-    return (
-        "Дай ответ на данный вопрос, используя информацию только из текста:\n"
-        f"\n{question}\n\n"
-        f"Текст:\n{joined}\n\n"
+def build_prompt(
+    question: str,
+    ontology_contexts: List[str],
+    text_fragments: List[TextFragment],
+) -> str:
+
+    ontology_text = "\n\n".join(ontology_contexts)
+
+    fragments_text = "\n\n".join(
+        f"[{fragment.entity_name}] {fragment.fragment}"
+        for fragment in text_fragments
     )
+
+    return f"""
+Ответь на заданный вопрос: {question}
+
+Используя основной текст:
+{ontology_text}
+
+Дополняя свой ответ данными текстами:
+{fragments_text}
+"""
 
 
 def _is_reasoner_model(model_name: str) -> bool:
@@ -236,8 +464,7 @@ def _build_chat_prompt(prompt: str) -> List[Dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "Ты помощник для RAG. "
-                "Отвечай строго на русском языке, только по фактам из контекста. "
+                "Отвечай строго на русском языке. "
                 "Никаких рассуждений о процессе, только итоговый ответ. "
                 "Формат: 1-2 коротких предложения."
             ),
@@ -312,6 +539,7 @@ def generate_answer(
 def run_rag(
     question: str,
     graph_path: Path,
+    markup_paths: List[Path],
     n_first: int,
     m_second: int,
     embedding_model: str,
@@ -326,7 +554,7 @@ def run_rag(
     n_ids = top_k_indices(query_embedding, index_embeddings, n_first)
     n_contexts = [texts[i] for i in n_ids]
 
-    first_prompt = build_prompt(question, n_contexts)
+    first_prompt = build_prompt(question, n_contexts, [])
     first_answer = (
         ""
         if no_llm
@@ -338,7 +566,24 @@ def run_rag(
     merged_ids = list(dict.fromkeys(n_ids + m_ids))
     merged_contexts = [texts[i] for i in merged_ids]
 
-    final_prompt = build_prompt(question, merged_contexts)
+    target_uris = {
+        paragraphs[i].node_id
+        for i in merged_ids
+    }
+
+    best_fragments = retrieve_text_fragments(
+        markup_paths=markup_paths,
+        target_uris=target_uris,
+        query_embedding=query_embedding,
+        embedding_model=embedding_model,
+        top_k=3,
+    )
+
+    final_prompt = build_prompt(
+        question,
+        merged_contexts,
+        best_fragments,
+    )
     final_answer = (
         "[LLM выключена: ответ не генерировался]"
         if no_llm
@@ -350,6 +595,7 @@ def run_rag(
         "n_ids": n_ids,
         "m_ids": m_ids,
         "merged_ids": merged_ids,
+        "best_fragments": best_fragments,
         "first_answer": first_answer,
         "final_answer": final_answer,
         "first_prompt": first_prompt,
@@ -360,6 +606,7 @@ def run_rag(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lab 28/04/2026: RAG over ontology graph.json")
     parser.add_argument("--graph", default="graph.json", help="Path to ontology graph.json")
+    parser.add_argument("--markups", nargs="+", default=["belosnezhka.json", "krasavitsa.json", "repunzel.json", "zolushka.json"], help="Markup json files")
     parser.add_argument("--question", required=True, help="User question")
     parser.add_argument("--n-first", type=int, default=5, help="Top-N nodes for first retrieval")
     parser.add_argument("--m-second", type=int, default=4, help="Top-M nodes for second retrieval from first answer")
@@ -374,6 +621,7 @@ def main() -> None:
     result = run_rag(
         question=args.question,
         graph_path=Path(args.graph),
+        markup_paths=[Path(p) for p in args.markups],
         n_first=args.n_first,
         m_second=args.m_second,
         embedding_model=args.embedding_model,
@@ -398,6 +646,14 @@ def main() -> None:
     for idx in result["merged_ids"]:
         para = result["paragraphs"][idx]
         print(f"- [{idx}] {para.title}")
+
+    print("\n=== Использованные текстовые фрагменты ===")
+
+    for idx, fragment in enumerate(result["best_fragments"], start=1):
+        print(
+            f"\n[{idx}] {fragment.entity_name}\n"
+            f"{fragment.fragment}\n"
+        )
 
     print("\n=== Финальный ответ ===")
     print(result["final_answer"])
