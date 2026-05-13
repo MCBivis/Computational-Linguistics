@@ -9,11 +9,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from lab_10_03_2026.embeddings import cos_compare, get_embeddings
+from fastembed import SparseTextEmbedding
 
 
 DEFAULT_GPT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+BM25_MODEL = "Qdrant/bm25"
+_sparse_model = SparseTextEmbedding(model_name=BM25_MODEL)
 
 TECH_KEYS = {
     "uri",
@@ -150,71 +151,106 @@ def _relation_name(uri: str, property_name_by_uri: Dict[str, str]) -> str:
     return property_name_by_uri.get(uri) or _humanize_key(uri)
 
 
-def build_paragraphs(graph_path: Path) -> List[NodeParagraph]:
-    graph = json.loads(graph_path.read_text(encoding="utf-8"))
-    node_by_id, arcs = _build_graph_maps(graph)
-    property_name_by_uri = _build_property_dictionary(node_by_id)
+def build_paragraphs(graph_paths: List[Path]) -> List[NodeParagraph]:
+    paragraphs = []
 
-    inbound: Dict[str, List[Dict[str, Any]]] = {}
-    outbound: Dict[str, List[Dict[str, Any]]] = {}
-    for arc in arcs:
-        src = arc.get("source")
-        dst = arc.get("target")
-        if src:
-            outbound.setdefault(src, []).append(arc)
-        if dst:
-            inbound.setdefault(dst, []).append(arc)
+    for graph_path in graph_paths:
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        node_by_id, arcs = _build_graph_maps(graph)
+        property_name_by_uri = _build_property_dictionary(node_by_id)
 
-    paragraphs: List[NodeParagraph] = []
+        inbound: Dict[str, List[Dict[str, Any]]] = {}
+        outbound: Dict[str, List[Dict[str, Any]]] = {}
+        for arc in arcs:
+            src = arc.get("source")
+            dst = arc.get("target")
+            if src:
+                outbound.setdefault(src, []).append(arc)
+            if dst:
+                inbound.setdefault(dst, []).append(arc)
 
-    for node_id, node in node_by_id.items():
-        if _is_property_node(node) or _is_class_node(node):
-            continue
-
-        title = _node_label(node)
-        lines = [f"Название: {title}"]
-        lines.extend(_iter_param_lines(node, property_name_by_uri))
-
-        for arc in outbound.get(node_id, []):
-            arc_uri = str(arc.get("data", {}).get("uri", ""))
-            target_node = node_by_id.get(arc.get("target"))
-            if not target_node:
+        for node_id, node in node_by_id.items():
+            if _is_property_node(node) or _is_class_node(node):
                 continue
-            relation = _relation_name(arc_uri, property_name_by_uri)
-            target_name = _node_label(target_node)
-            if arc_uri == RDF_TYPE_URI:
-                lines.append(f"Имеет тип: {target_name}")
-            else:
-                lines.append(f"{relation}: {target_name}")
 
-        for arc in inbound.get(node_id, []):
-            arc_uri = str(arc.get("data", {}).get("uri", ""))
-            source_node = node_by_id.get(arc.get("source"))
-            if not source_node:
-                continue
-            relation = _relation_name(arc_uri, property_name_by_uri)
-            source_name = _node_label(source_node)
-            if arc_uri == RDF_TYPE_URI:
-                lines.append(f"Тип для: {source_name}")
-            else:
-                lines.append(f"{relation}: {source_name}")
+            title = _node_label(node)
+            lines = [f"Название: {title}"]
+            lines.extend(_iter_param_lines(node, property_name_by_uri))
 
-        text = "\n".join(dict.fromkeys(lines))
-        paragraphs.append(NodeParagraph(node_id=node_id, title=title, text=text))
+            for arc in outbound.get(node_id, []):
+                arc_uri = str(arc.get("data", {}).get("uri", ""))
+                target_node = node_by_id.get(arc.get("target"))
+                if not target_node:
+                    continue
+                relation = _relation_name(arc_uri, property_name_by_uri)
+                target_name = _node_label(target_node)
+                if arc_uri == RDF_TYPE_URI:
+                    lines.append(f"Имеет тип: {target_name}")
+                else:
+                    lines.append(f"{relation}: {target_name}")
+
+            for arc in inbound.get(node_id, []):
+                arc_uri = str(arc.get("data", {}).get("uri", ""))
+                source_node = node_by_id.get(arc.get("source"))
+                if not source_node:
+                    continue
+                relation = _relation_name(arc_uri, property_name_by_uri)
+                source_name = _node_label(source_node)
+                if arc_uri == RDF_TYPE_URI:
+                    lines.append(f"Тип для: {source_name}")
+                else:
+                    lines.append(f"{relation}: {source_name}")
+
+            text = "\n".join(dict.fromkeys(lines))
+            paragraphs.append(NodeParagraph(node_id=node_id, title=title, text=text))
 
     return paragraphs
 
 
-def top_k_indices(query_embedding: np.ndarray, index_embeddings: np.ndarray, k: int) -> List[int]:
-    sims = cos_compare(query_embedding, index_embeddings)
-    scores = np.asarray(sims, dtype=np.float32)
-    if scores.ndim != 1:
-        scores = scores.reshape(-1)
-    k = min(k, len(scores))
-    if k <= 0:
-        return []
-    top_ids = np.argsort(scores)[::-1][:k]
-    return [int(i) for i in top_ids]
+def sparse_to_dict(sparse_embedding) -> Dict[int, float]:
+    return dict(zip(sparse_embedding.indices.tolist(),
+                    sparse_embedding.values.tolist()))
+
+
+def sparse_score(
+    query_dict: Dict[int, float],
+    doc_dict: Dict[int, float],
+) -> float:
+    score = 0.0
+
+    smaller, larger = (
+        (query_dict, doc_dict)
+        if len(query_dict) < len(doc_dict)
+        else (doc_dict, query_dict)
+    )
+
+    for idx, value in smaller.items():
+        if idx in larger:
+            score += value * larger[idx]
+
+    return score
+
+
+def top_k_sparse(
+    query_embedding,
+    document_embeddings,
+    k: int,
+) -> List[int]:
+
+    query_dict = sparse_to_dict(query_embedding)
+
+    scores = []
+
+    for idx, doc_embedding in enumerate(document_embeddings):
+        doc_dict = sparse_to_dict(doc_embedding)
+
+        sim = sparse_score(query_dict, doc_dict)
+
+        scores.append((idx, sim))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    return [idx for idx, _ in scores[:k]]
 
 
 def build_prompt(question: str, contexts: List[str]) -> str:
@@ -311,19 +347,19 @@ def generate_answer(
 
 def run_rag(
     question: str,
-    graph_path: Path,
+    graph_paths: List[Path],
     n_first: int,
     m_second: int,
-    embedding_model: str,
     llm_model: str,
     no_llm: bool,
 ) -> Dict[str, Any]:
-    paragraphs = build_paragraphs(graph_path)
+    paragraphs = build_paragraphs(graph_paths)
     texts = [p.text for p in paragraphs]
-    index_embeddings = get_embeddings(texts, model_name=embedding_model)
+    index_embeddings = list(_sparse_model.embed(texts))
 
-    query_embedding = get_embeddings(question, model_name=embedding_model)
-    n_ids = top_k_indices(query_embedding, index_embeddings, n_first)
+    query_embedding = next(_sparse_model.embed([question]))
+
+    n_ids = top_k_sparse(query_embedding, index_embeddings, n_first)
     n_contexts = [texts[i] for i in n_ids]
 
     first_prompt = build_prompt(question, n_contexts)
@@ -333,8 +369,8 @@ def run_rag(
         else generate_answer(first_prompt, model_name=llm_model)
     )
 
-    answer_embedding = get_embeddings(first_answer, model_name=embedding_model)
-    m_ids = top_k_indices(answer_embedding, index_embeddings, m_second)
+    answer_embedding = next(_sparse_model.embed([first_answer]))
+    m_ids = top_k_sparse(answer_embedding, index_embeddings, m_second)
     merged_ids = list(dict.fromkeys(n_ids + m_ids))
     merged_contexts = [texts[i] for i in merged_ids]
 
@@ -359,11 +395,20 @@ def run_rag(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lab 28/04/2026: RAG over ontology graph.json")
-    parser.add_argument("--graph", default="graph.json", help="Path to ontology graph.json")
+    parser.add_argument(
+        "--graphs",
+        nargs="+",
+        default=[
+            "graph.json",
+            "graph2.json",
+            "ontology.json",
+            "ontology_all_films.json",
+        ],
+        help="List of graph json files",
+    )
     parser.add_argument("--question", required=True, help="User question")
     parser.add_argument("--n-first", type=int, default=5, help="Top-N nodes for first retrieval")
     parser.add_argument("--m-second", type=int, default=4, help="Top-M nodes for second retrieval from first answer")
-    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
     parser.add_argument("--llm-model", default=DEFAULT_GPT_MODEL)
     parser.add_argument("--no-llm", action="store_true", help="Skip text generation, test retrieval only")
     return parser.parse_args()
@@ -373,10 +418,9 @@ def main() -> None:
     args = parse_args()
     result = run_rag(
         question=args.question,
-        graph_path=Path(args.graph),
+        graph_paths=[Path(p) for p in args.graphs],
         n_first=args.n_first,
         m_second=args.m_second,
-        embedding_model=args.embedding_model,
         llm_model=args.llm_model,
         no_llm=args.no_llm,
     )
@@ -402,6 +446,8 @@ def main() -> None:
     print("\n=== Финальный ответ ===")
     print(result["final_answer"])
 
+    print("\n=== Статистика ===")
+    print(f"Количество Узлов(NodeParagraph): {len(result['paragraphs'])}")
 
 if __name__ == "__main__":
     main()
